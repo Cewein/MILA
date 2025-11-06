@@ -445,6 +445,49 @@ def training(
             if iteration == (args.simp_iteration2+opt.iterations)//2:
                 gaussians.init_culling(len(scene.getTrainCameras()))
 
+            # --- Adaptive mesh-guided pruning ---
+            if args.mesh_regularization and iteration > args.mesh_prune_warmup:
+                if (iteration % args.mesh_prune_interval) == 0:
+                    # 1) Accumulate importance over a subset of cameras
+                    gaussians._imp_contrib.zero_()
+                    gaussians._imp_vis_count.zero_()
+
+                    train_cams = scene.getTrainCameras()  # already used elsewhere
+
+                    # You probably don't want to loop over *all* views every time; sample M of them
+                    M = min(len(train_cams), args.mesh_prune_num_views)
+                    with torch.no_grad():
+                        for k in range(M):
+                            cam = train_cams[k]
+                            # Render using Mini-Splatting2 rasterizer (so you get accum_weights)
+                            render_pkg = render_full(
+                                cam,
+                                gaussians,
+                                pipe,
+                                background,
+                                culling=gaussians._culling[:, cam.uid],
+                                compute_expected_normals=False,
+                                compute_expected_depth=False,
+                                compute_accurate_median_depth_gradient=False,
+                            )
+
+                            accum_weights = render_pkg["accum_weights"]  # (N,)
+                            # Use per-view CDF to decide which Gaussians were 'important' in this view
+                            per_view_keep = init_cdf_mask(accum_weights, thres=0.99)
+                            gaussians.accumulate_importance_stats(accum_weights, per_view_keep)
+
+                    # 2) Build SDF (here using occupancy-based SDF shortcut)
+                    sdf_values = gaussians.get_truncated_sdf_from_occupancy()
+
+                    # 3) Mesh-guided pruning
+                    gaussians.mesh_guided_prune(
+                        sdf_values=sdf_values,
+                        keep_mass=args.mesh_prune_keep_mass,
+                        lambda_dist=args.mesh_prune_lambda,
+                        dist_band=args.mesh_prune_band,
+                        min_vis=args.mesh_prune_min_vis,
+                    )
+
             # ---Reset mesh state if Gaussians have changed---
             if mesh_kick_on and gaussians_have_changed:
                 mesh_state = reset_mesh_state_at_next_iteration(mesh_state)
@@ -559,7 +602,16 @@ if __name__ == "__main__":
     parser.add_argument("--simp_iteration1", type=int, default = 3_000)
     parser.add_argument("--simp_iteration2", type=int, default = 8_000)
     parser.add_argument("--sampling_factor", type=float, default = 0.6)
-    
+
+    # ----- Adaptive mesh-guided pruning -----
+    parser.add_argument("--mesh_prune_warmup", type=int, default=1000)
+    parser.add_argument("--mesh_prune_interval", type=int, default=100)
+    parser.add_argument("--mesh_prune_num_views", type=int, default=1)
+    parser.add_argument("--mesh_prune_keep_mass", type=float, default=0.9)
+    parser.add_argument("--mesh_prune_lambda", type=float, default=0.1)
+    parser.add_argument("--mesh_prune_band", type=float, default=0.1)
+    parser.add_argument("--mesh_prune_min_vis", type=float, default=0.1)
+
     # ----- Depth-Normal consistency Regularization -----
     # > Inspired by 2DGS, GOF, RaDe-GS...
     parser.add_argument("--regularization_from_iter", type=int, default = 3_000)

@@ -89,6 +89,8 @@ class GaussianModel:
         self.percent_dense = 0
         self.spatial_lr_scale = 0
         self.setup_functions()
+        self._imp_contrib = torch.empty(0)
+        self._imp_vis_count = torch.empty(0)   
         
         self.use_appearance_network = use_appearance_network
         if use_appearance_network:
@@ -572,6 +574,87 @@ class GaussianModel:
                                                     lr_final=training_args.position_lr_final*self.spatial_lr_scale,
                                                     lr_delay_mult=training_args.position_lr_delay_mult,
                                                     max_steps=training_args.position_lr_max_steps)
+        
+        N = self._xyz.shape[0]
+        device = self._xyz.device
+        self._imp_contrib = torch.zeros(N, device=device)
+        self._imp_vis_count = torch.zeros(N, device=device, dtype=torch.long)
+
+    @torch.no_grad()
+    def accumulate_importance_stats(self, accum_weights: torch.Tensor,
+                                    per_view_keep_mask: torch.Tensor):
+        """
+        accum_weights: (N,) contribution of each Gaussian in this view
+        per_view_keep_mask: (N,) bool mask of 'important in this view'
+        """
+        if self._imp_contrib.numel() == 0:
+            # first time: allocate
+            N = accum_weights.shape[0]
+            device = accum_weights.device
+            self._imp_contrib = torch.zeros(N, device=device)
+            self._imp_vis_count = torch.zeros(N, device=device, dtype=torch.long)
+
+        self._imp_contrib += accum_weights
+        self._imp_vis_count += per_view_keep_mask.long()
+
+    @torch.no_grad()
+    def mesh_guided_prune(self,
+                        sdf_values: torch.Tensor,
+                        keep_mass: float = 0.99,
+                        lambda_dist: float = 10.0,
+                        dist_band: float = 0.05,
+                        min_vis: int = 1):
+        """
+        sdf_values: (N,) signed distance to surface for each Gaussian centre.
+                    Could come from the mesh SDF or from occupancy-based SDF.
+        keep_mass:  rho in the LaTeX (fraction of total importance mass to retain)
+        lambda_dist: lambda in the LaTeX, controls exp(-lambda |d|)
+        dist_band:  delta_t in the LaTeX, max allowed |d|
+        min_vis:    k_min in the LaTeX, minimum number of views where Gaussian is important
+        """
+
+        device = self._xyz.device
+        N = self._xyz.shape[0]
+
+        # Sanity check
+        assert sdf_values.shape[0] == N
+
+        # 1) Get W_i = accumulated contribution, alpha_i = opacity
+        W = self._imp_contrib
+        alpha = self.get_opacity().squeeze(-1)
+
+        # 2) Mesh-aware importance: I_i = alpha_i * W_i * exp(-lambda |d_i|)
+        I = alpha * W * torch.exp(-lambda_dist * sdf_values.abs())
+
+        # 3) CDF-based global mask (keep top keep_mass of total importance)
+        keep_imp_mask = init_cdf_mask(I, thres=keep_mass)
+
+        # 4) Visibility and distance masks
+        bad_vis_mask = self._imp_vis_count <= min_vis
+        bad_dist_mask = sdf_values.abs() > dist_band
+
+        # 5) Final prune mask = eq. (2) in your LaTeX
+        prune_mask = (~keep_imp_mask) | bad_vis_mask | bad_dist_mask
+
+        # 6) Apply: this function already exists in MILo
+        self.prune_points(prune_mask)
+
+        # 7) Reset stats for next pruning phase
+        self._imp_contrib = torch.zeros_like(W)
+        self._imp_vis_count = torch.zeros_like(self._imp_vis_count)
+
+    def get_truncated_sdf_from_occupancy(self):
+        """
+        Returns d_i in [-1, 1] as a proxy SDF per Gaussian,
+        using the occupancy logit as described in MILo.
+        """
+        if not self.learn_occupancy:
+            raise RuntimeError("Occupancy not enabled; can't use this SDF shortcut.")
+
+        occ = self.get_occupancy()
+        occ_per_gaussian = occ.mean(dim=1)
+        sdf = 2.0 * occ_per_gaussian - 1.0
+        return sdf
 
 
     def update_learning_rate(self, iteration):
