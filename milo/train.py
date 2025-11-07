@@ -3,6 +3,7 @@ import sys
 import gc
 import yaml
 from functools import partial
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 ROOT_DIR = os.path.abspath(os.path.join(BASE_DIR, '..'))
 SUBMODULES_DIR = os.path.join(ROOT_DIR, 'submodules')
@@ -18,6 +19,7 @@ from fused_ssim import fused_ssim
 from gaussian_renderer import network_gui
 from gaussian_renderer import render_imp, render_simp, render_depth, render_full
 import sys
+from scene.gaussian_model import init_cdf_mask
 from scene import Scene, GaussianModel
 from utils.general_utils import safe_state
 import uuid
@@ -412,9 +414,12 @@ def training(
             # ---Pruning and simplification---
             if iteration == args.simp_iteration1:
                 if args.dense_gaussians:
-                    gaussians.culling_with_importance_pruning(scene, render_simp, iteration, args, pipe, background)
+                    gaussians.culling_with_mesh_aware_pruning(scene, render_simp, iteration, args, pipe, background)
+                    #gaussians.culling_with_importance_pruning(scene, render_simp, iteration, args, pipe, background)
+                    print(f"Importance pruning at iteration {iteration}, num Gaussians: {gaussians._xyz.shape[0]}")
                 else:
                     gaussians.culling_with_interesction_sampling(scene, render_simp, iteration, args, pipe, background)
+                    print(f"Normal pruning at iteration {iteration}, num Gaussians: {gaussians._xyz.shape[0]}")
                 gaussians.max_sh_degree=dataset.sh_degree
                 gaussians.extend_features_rest()
 
@@ -430,7 +435,8 @@ def training(
                 
             if iteration == args.simp_iteration2:
                 if args.dense_gaussians:
-                    gaussians.culling_with_importance_pruning(scene, render_simp, iteration, args, pipe, background)
+                    gaussians.culling_with_mesh_aware_pruning(scene, render_simp, iteration, args, pipe, background)
+                    #gaussians.culling_with_importance_pruning(scene, render_simp, iteration, args, pipe, background)
                 else:
                     gaussians.culling_with_interesction_preserving(scene, render_simp, iteration, args, pipe, background)
                 torch.cuda.empty_cache()
@@ -444,49 +450,6 @@ def training(
 
             if iteration == (args.simp_iteration2+opt.iterations)//2:
                 gaussians.init_culling(len(scene.getTrainCameras()))
-
-            # --- Adaptive mesh-guided pruning ---
-            if args.mesh_regularization and iteration > args.mesh_prune_warmup:
-                if (iteration % args.mesh_prune_interval) == 0:
-                    # 1) Accumulate importance over a subset of cameras
-                    gaussians._imp_contrib.zero_()
-                    gaussians._imp_vis_count.zero_()
-
-                    train_cams = scene.getTrainCameras()  # already used elsewhere
-
-                    # You probably don't want to loop over *all* views every time; sample M of them
-                    M = min(len(train_cams), args.mesh_prune_num_views)
-                    with torch.no_grad():
-                        for k in range(M):
-                            cam = train_cams[k]
-                            # Render using Mini-Splatting2 rasterizer (so you get accum_weights)
-                            render_pkg = render_full(
-                                cam,
-                                gaussians,
-                                pipe,
-                                background,
-                                culling=gaussians._culling[:, cam.uid],
-                                compute_expected_normals=False,
-                                compute_expected_depth=False,
-                                compute_accurate_median_depth_gradient=False,
-                            )
-
-                            accum_weights = render_pkg["accum_weights"]  # (N,)
-                            # Use per-view CDF to decide which Gaussians were 'important' in this view
-                            per_view_keep = init_cdf_mask(accum_weights, thres=0.99)
-                            gaussians.accumulate_importance_stats(accum_weights, per_view_keep)
-
-                    # 2) Build SDF (here using occupancy-based SDF shortcut)
-                    sdf_values = gaussians.get_truncated_sdf_from_occupancy()
-
-                    # 3) Mesh-guided pruning
-                    gaussians.mesh_guided_prune(
-                        sdf_values=sdf_values,
-                        keep_mass=args.mesh_prune_keep_mass,
-                        lambda_dist=args.mesh_prune_lambda,
-                        dist_band=args.mesh_prune_band,
-                        min_vis=args.mesh_prune_min_vis,
-                    )
 
             # ---Reset mesh state if Gaussians have changed---
             if mesh_kick_on and gaussians_have_changed:
