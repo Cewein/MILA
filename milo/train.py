@@ -412,7 +412,9 @@ def training(
             # ---Pruning and simplification---
             if iteration == args.simp_iteration1:
                 if args.dense_gaussians:
+                    #gaussians.culling_with_mesh_aware_pruning(scene, render_simp, iteration, args, pipe, background)
                     gaussians.culling_with_importance_pruning(scene, render_simp, iteration, args, pipe, background)
+                    print(f"Importance pruning at iteration {iteration}, num Gaussians: {gaussians._xyz.shape[0]}")
                 else:
                     gaussians.culling_with_interesction_sampling(scene, render_simp, iteration, args, pipe, background)
                 gaussians.max_sh_degree=dataset.sh_degree
@@ -430,6 +432,7 @@ def training(
                 
             if iteration == args.simp_iteration2:
                 if args.dense_gaussians:
+                    #gaussians.culling_with_mesh_aware_pruning(scene, render_simp, iteration, args, pipe, background)
                     gaussians.culling_with_importance_pruning(scene, render_simp, iteration, args, pipe, background)
                 else:
                     gaussians.culling_with_interesction_preserving(scene, render_simp, iteration, args, pipe, background)
@@ -559,7 +562,13 @@ if __name__ == "__main__":
     parser.add_argument("--simp_iteration1", type=int, default = 3_000)
     parser.add_argument("--simp_iteration2", type=int, default = 8_000)
     parser.add_argument("--sampling_factor", type=float, default = 0.6)
-    
+
+    # ----- Adaptive mesh-guided pruning -----
+    parser.add_argument("--mesh_prune_keep_mass", type=float, default=0.90)
+    parser.add_argument("--mesh_prune_lambda", type=float, default=10.0)
+    parser.add_argument("--mesh_prune_band", type=float, default=0.05)
+    parser.add_argument("--mesh_prune_min_vis", type=float, default=1.0)
+
     # ----- Depth-Normal consistency Regularization -----
     # > Inspired by 2DGS, GOF, RaDe-GS...
     parser.add_argument("--regularization_from_iter", type=int, default = 3_000)
