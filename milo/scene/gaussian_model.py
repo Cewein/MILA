@@ -9,6 +9,7 @@
 # For inquiries contact  george.drettakis@inria.fr
 #
 
+from random import random
 import torch
 import math
 import numpy as np
@@ -89,6 +90,8 @@ class GaussianModel:
         self.percent_dense = 0
         self.spatial_lr_scale = 0
         self.setup_functions()
+        self._imp_contrib = torch.empty(0)
+        self._imp_vis_count = torch.empty(0)   
         
         self.use_appearance_network = use_appearance_network
         if use_appearance_network:
@@ -572,7 +575,11 @@ class GaussianModel:
                                                     lr_final=training_args.position_lr_final*self.spatial_lr_scale,
                                                     lr_delay_mult=training_args.position_lr_delay_mult,
                                                     max_steps=training_args.position_lr_max_steps)
-
+        
+        N = self._xyz.shape[0]
+        device = self._xyz.device
+        self._imp_contrib = torch.zeros(N, device=device)
+        self._imp_vis_count = torch.zeros(N, device=device, dtype=torch.long)
 
     def update_learning_rate(self, iteration):
         ''' Learning rate scheduling per step '''
@@ -1469,6 +1476,63 @@ class GaussianModel:
         prune_mask = torch.logical_or(prune_mask, non_prune_mask==False)
         self.prune_points(prune_mask) 
 
+    def culling_with_mesh_aware_pruning(self, scene, render_simp, iteration, args, pipe, background):
+        imp_score = torch.zeros(self._xyz.shape[0], device='cuda')
+        views = scene.getTrainCameras_warn_up(iteration, args.warn_until_iter, scale=1.0, scale2=2.0).copy()
+
+        self._culling=torch.zeros((self._xyz.shape[0], len(views)), dtype=torch.bool, device='cuda')
+
+        count_rad = torch.zeros((self._xyz.shape[0], 1), device='cuda')
+        count_vis = torch.zeros((self._xyz.shape[0], 1), device='cuda')
+
+        for view in views:
+            culling_mask = self._culling[:, view.uid]
+            active_indices = torch.nonzero(~culling_mask).squeeze()  # Indices of non-culled Gaussians
+
+            render_pkg = render_simp(view, self, pipe, background, culling=culling_mask)
+
+            accum_weights = render_pkg["accum_weights"]  # Size: N_active
+            radii = render_pkg["radii"]  # Size: N_active
+
+            imp_score[active_indices] += accum_weights
+
+            non_prune_mask = init_cdf_mask(importance=accum_weights, thres=0.99)  # Bool mask, size: N_active
+
+            # Update culling for active Gaussians only (culled remain culled)
+            self._culling[active_indices, view.uid] = (non_prune_mask == False)
+
+            # Update count_rad for active Gaussians where radii > 0
+            rad_pos = (radii > 0)
+            count_rad[active_indices[rad_pos]] += 1
+
+            # Update count_vis for active Gaussians where non_prune_mask
+            vis_pos = non_prune_mask
+            count_vis[active_indices[vis_pos]] += 1
+
+        # Compute distances using occupancy-based SDF shortcut (as per doc)
+        self.set_occupancy_mode("occupancy_shift")
+        occupancy = self.get_occupancy[:, 0].squeeze() # (N,)
+        # Example mapping: [0,1] -> [band, -band]; adjust beta/band to scene units (e.g., lambda * typical_width ~1)
+        beta = args.mesh_prune_band  # Reuse band as scaling factor
+        sdf_values = beta * (1.0 - 2.0 * occupancy)  # High occ -> negative/inside, low -> positive/outside
+        sdf_values = torch.clamp(sdf_values, -beta, beta)  # Truncate
+        dist = torch.abs(sdf_values)
+
+        # Compute mesh-aware importance
+        alpha = self.get_opacity.squeeze()
+        # Optionally normalize imp_score by number of views: imp_score /= len(views)
+        I = alpha * imp_score * torch.exp(-args.mesh_prune_lambda * dist)
+
+        # Global non_prune_mask via CDF (note: adjust thres if your init_cdf_mask prunes below thres)
+        non_prune_mask = init_cdf_mask(importance=I, thres=args.mesh_prune_keep_mass)
+
+        self.factor_culling = count_vis / (count_rad + 1e-1)
+
+        prune_mask = (count_vis <= args.mesh_prune_min_vis)[:, 0]
+        prune_mask = torch.logical_or(prune_mask, non_prune_mask == False)
+        prune_mask = torch.logical_or(prune_mask, dist > args.mesh_prune_band)
+
+        self.prune_points(prune_mask)
 
     def extend_features_rest(self):
 

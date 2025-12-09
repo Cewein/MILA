@@ -3,6 +3,7 @@ import sys
 import gc
 import yaml
 from functools import partial
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 ROOT_DIR = os.path.abspath(os.path.join(BASE_DIR, '..'))
 SUBMODULES_DIR = os.path.join(ROOT_DIR, 'submodules')
@@ -18,6 +19,7 @@ from fused_ssim import fused_ssim
 from gaussian_renderer import network_gui
 from gaussian_renderer import render_imp, render_simp, render_depth, render_full
 import sys
+from scene.gaussian_model import init_cdf_mask
 from scene import Scene, GaussianModel
 from utils.general_utils import safe_state
 import uuid
@@ -412,11 +414,12 @@ def training(
             # ---Pruning and simplification---
             if iteration == args.simp_iteration1:
                 if args.dense_gaussians:
-                    #gaussians.culling_with_mesh_aware_pruning(scene, render_simp, iteration, args, pipe, background)
-                    gaussians.culling_with_importance_pruning(scene, render_simp, iteration, args, pipe, background)
+                    gaussians.culling_with_mesh_aware_pruning(scene, render_simp, iteration, args, pipe, background)
+                    #gaussians.culling_with_importance_pruning(scene, render_simp, iteration, args, pipe, background)
                     print(f"Importance pruning at iteration {iteration}, num Gaussians: {gaussians._xyz.shape[0]}")
                 else:
                     gaussians.culling_with_interesction_sampling(scene, render_simp, iteration, args, pipe, background)
+                    print(f"Normal pruning at iteration {iteration}, num Gaussians: {gaussians._xyz.shape[0]}")
                 gaussians.max_sh_degree=dataset.sh_degree
                 gaussians.extend_features_rest()
 
@@ -432,8 +435,8 @@ def training(
                 
             if iteration == args.simp_iteration2:
                 if args.dense_gaussians:
-                    #gaussians.culling_with_mesh_aware_pruning(scene, render_simp, iteration, args, pipe, background)
-                    gaussians.culling_with_importance_pruning(scene, render_simp, iteration, args, pipe, background)
+                    gaussians.culling_with_mesh_aware_pruning(scene, render_simp, iteration, args, pipe, background)
+                    #gaussians.culling_with_importance_pruning(scene, render_simp, iteration, args, pipe, background)
                 else:
                     gaussians.culling_with_interesction_preserving(scene, render_simp, iteration, args, pipe, background)
                 torch.cuda.empty_cache()
