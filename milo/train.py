@@ -567,13 +567,10 @@ if __name__ == "__main__":
     parser.add_argument("--sampling_factor", type=float, default = 0.6)
 
     # ----- Adaptive mesh-guided pruning -----
-    parser.add_argument("--mesh_prune_warmup", type=int, default=1000)
-    parser.add_argument("--mesh_prune_interval", type=int, default=100)
-    parser.add_argument("--mesh_prune_num_views", type=int, default=1)
-    parser.add_argument("--mesh_prune_keep_mass", type=float, default=0.9)
-    parser.add_argument("--mesh_prune_lambda", type=float, default=0.1)
-    parser.add_argument("--mesh_prune_band", type=float, default=0.1)
-    parser.add_argument("--mesh_prune_min_vis", type=float, default=0.1)
+    parser.add_argument("--mesh_prune_keep_mass", type=float, default=0.90)
+    parser.add_argument("--mesh_prune_lambda", type=float, default=10.0)
+    parser.add_argument("--mesh_prune_band", type=float, default=0.05)
+    parser.add_argument("--mesh_prune_min_vis", type=float, default=1.0)
 
     # ----- Depth-Normal consistency Regularization -----
     # > Inspired by 2DGS, GOF, RaDe-GS...
