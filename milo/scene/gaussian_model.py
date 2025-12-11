@@ -91,7 +91,14 @@ class GaussianModel:
         self.spatial_lr_scale = 0
         self.setup_functions()
         self._imp_contrib = torch.empty(0)
-        self._imp_vis_count = torch.empty(0)   
+        self._imp_vis_count = torch.empty(0)
+
+        # Per-Gaussian appearance statistics
+        self.color_sum = torch.empty(0)
+        self.color_sq_sum = torch.empty(0)
+        self.obs_count = torch.empty(0)
+        self.uncertainty = torch.empty(0)
+        self.variance = torch.empty(0)
         
         self.use_appearance_network = use_appearance_network
         if use_appearance_network:
@@ -136,6 +143,15 @@ class GaussianModel:
             to_return += (self._base_occupancy, self._occupancy_shift)
         if self.use_appearance_network:
             to_return += (self.appearance_network.state_dict(), self._appearance_embeddings,)
+        
+        to_return += (
+            self.color_sum,
+            self.color_sq_sum,
+            self.obs_count,
+            self.uncertainty,
+            self.variance,
+        )
+
         return to_return
     
     def restore(self, model_args, training_args):
@@ -160,8 +176,10 @@ class GaussianModel:
             app_dict = model_args[start_idx]
             self._appearance_embeddings = model_args[start_idx + 1]
             start_idx = start_idx + 2
-        if start_idx != len(model_args):
-            print(f"[ WARNING ] Restoring model with extra arguments: Only {start_idx} arguments expected, but {len(model_args)} provided.")
+
+        start_idx_stats = start_idx + 5
+        if start_idx_stats != len(model_args):
+            print(f"[ WARNING ] Restoring model with extra arguments: Only {start_idx_stats} arguments expected, but {len(model_args)} provided.")
         
         self.training_setup(training_args)
         self.xyz_gradient_accum = xyz_gradient_accum
@@ -169,6 +187,14 @@ class GaussianModel:
         self.optimizer.load_state_dict(opt_dict)
         if self.use_appearance_network:
             self.appearance_network.load_state_dict(app_dict)
+
+        # Restore appearance statistics after optimizer reset
+        self.color_sum = model_args[start_idx]
+        self.color_sq_sum = model_args[start_idx + 1]
+        self.obs_count = model_args[start_idx + 2]
+        self.uncertainty = model_args[start_idx + 3]
+        self.variance = model_args[start_idx + 4]
+        start_idx = start_idx_stats
 
     @property
     def get_scaling(self):
@@ -403,12 +429,94 @@ class GaussianModel:
         self._rotation = nn.Parameter(rots.requires_grad_(True))
         self._opacity = nn.Parameter(opacities.requires_grad_(True))
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+
+        # Initialize per-Gaussian appearance statistics
+        self.reset_uncertainty_buffers()
             
         if self.learn_occupancy:
             base_occupancy = torch.zeros((self._xyz.shape[0], 9), device="cuda")
             occupancy_shift = torch.zeros((self._xyz.shape[0], 9), device="cuda")
             self._base_occupancy = nn.Parameter(base_occupancy.requires_grad_(False), requires_grad=False)  # Do not learn base occupancy
             self._occupancy_shift = nn.Parameter(occupancy_shift.requires_grad_(True))  # Learn occupancy shift
+    
+    def reset_uncertainty_buffers(self):
+        device = self._xyz.device
+        N = self._xyz.shape[0]
+        self.color_sum = torch.zeros((N, 3), device=device)
+        self.color_sq_sum = torch.zeros((N,), device=device)
+        self.obs_count = torch.zeros((N,), device=device)
+        self.uncertainty = torch.ones((N,), device=device)
+        self.variance = torch.zeros((N,), device=device)
+
+    def _extend_uncertainty_buffers(self, n_new: int):
+        if n_new == 0:
+            return
+        device = self._xyz.device
+        zeros_color = torch.zeros((n_new, 3), device=device)
+        zeros_sq = torch.zeros((n_new,), device=device)
+        zeros_count = torch.zeros((n_new,), device=device)
+        ones_uncertainty = torch.ones((n_new,), device=device)
+        self.color_sum = torch.cat((self.color_sum, zeros_color), dim=0)
+        self.color_sq_sum = torch.cat((self.color_sq_sum, zeros_sq), dim=0)
+        self.obs_count = torch.cat((self.obs_count, zeros_count), dim=0)
+        self.uncertainty = torch.cat((self.uncertainty, ones_uncertainty), dim=0)
+        self.variance = torch.cat((self.variance, zeros_sq), dim=0)
+
+    def accumulate_color_stats(self, gaussian_idx: torch.Tensor, gt_image: torch.Tensor):
+        if gaussian_idx is None:
+            return
+        ids = gaussian_idx.view(-1).long()
+        colors = gt_image.view(-1, 3)
+        valid = ids >= 0
+        if not torch.any(valid):
+            return
+        ids_v = ids[valid]
+        gt_v = colors[valid]
+        ones = torch.ones_like(ids_v, dtype=torch.float32, device=gt_image.device)
+        self.obs_count.index_add_(0, ids_v, ones)
+        self.color_sum.index_add_(0, ids_v, gt_v)
+        self.color_sq_sum.index_add_(0, ids_v, (gt_v ** 2).sum(dim=-1))
+
+    def compute_uncertainty_weights(self, gamma: float = 1.0, eps: float = 1e-6, reset_stats: bool = False):
+        if self.color_sum.numel() == 0:
+            return {
+                "mean": None,
+                "variance": None,
+                "uncertainty": None,
+            }
+        obs = self.obs_count.clamp_min(1.0)
+        mean = self.color_sum / obs.unsqueeze(-1)
+        ms = self.color_sq_sum / obs
+        var = ms - (mean ** 2).sum(-1)
+        var = torch.clamp(var, min=0.0)
+
+        var_med = var.median()
+        mad = (var - var_med).abs().median() + eps
+        z = (var - var_med) / mad
+        z = torch.tanh(z)
+        z = torch.clamp(z, min=0.0)
+
+        self.uncertainty = torch.exp(-gamma * z)
+        self.variance = var
+
+        if reset_stats:
+            self.color_sum.zero_()
+            self.color_sq_sum.zero_()
+            self.obs_count.zero_()
+
+        return {"mean": mean, "variance": var, "uncertainty": self.uncertainty}
+
+    def get_uncertainty_map(self, gaussian_idx: torch.Tensor):
+        if gaussian_idx is None:
+            return None
+        idx = gaussian_idx
+        if idx.dim() > 2:
+            idx = idx.squeeze(0)
+        mask = torch.zeros_like(idx, dtype=torch.float32, device=idx.device)
+        valid = idx >= 0
+        if torch.any(valid):
+            mask[valid] = self.uncertainty[idx[valid]]
+        return mask
         
     def _get_tetra_points(
         self, 
@@ -543,6 +651,9 @@ class GaussianModel:
         self.percent_dense = training_args.percent_dense
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+
+        # Reset appearance statistics for a fresh training run
+        self.reset_uncertainty_buffers()
         
         if self.use_radegs_densification:
             self.xyz_gradient_accum_abs = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
@@ -810,6 +921,12 @@ class GaussianModel:
         self._culling = self._culling[valid_points_mask]
         self.factor_culling = self.factor_culling[valid_points_mask]
 
+        self.color_sum = self.color_sum[valid_points_mask]
+        self.color_sq_sum = self.color_sq_sum[valid_points_mask]
+        self.obs_count = self.obs_count[valid_points_mask]
+        self.uncertainty = self.uncertainty[valid_points_mask]
+        self.variance = self.variance[valid_points_mask]
+
 
     def cat_tensors_to_optimizer(self, tensors_dict):
         optimizable_tensors = {}
@@ -862,6 +979,8 @@ class GaussianModel:
         if self.learn_occupancy:
             self._base_occupancy = torch.cat((self._base_occupancy, new_base_occupancy), dim=0)  # Do not require grad
             self._occupancy_shift = optimizable_tensors["occupancy_shift"]
+
+        self._extend_uncertainty_buffers(new_xyz.shape[0])
 
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
@@ -1063,6 +1182,9 @@ class GaussianModel:
         self._rotation = nn.Parameter(rots.requires_grad_(True))
         self._opacity = nn.Parameter(opacities.requires_grad_(True))
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")  
+
+        self.reset_uncertainty_buffers()
+
         if self.learn_occupancy:
             self._base_occupancy = nn.Parameter(base_occupancy.requires_grad_(False))
             self._occupancy_shift = nn.Parameter(occupancy_shift.requires_grad_(True))

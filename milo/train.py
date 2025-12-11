@@ -217,11 +217,43 @@ def training(
         )
         gt_image = viewpoint_cam.original_image.cuda()
 
+        gaussian_idx = render_pkg.get("gaussian_idx", None)
+        if gaussian_idx is None:
+            with torch.no_grad():
+                depth_pkg = render_depth(
+                    viewpoint_cam, gaussians, pipe, background,
+                    culling=gaussians._culling[:,viewpoint_cam.uid],
+                )
+                gaussian_idx = depth_pkg.get("gidx")
+        if gaussian_idx is not None:
+            gaussian_idx = gaussian_idx.squeeze()
+            with torch.no_grad():
+                gaussians.accumulate_color_stats(
+                    gaussian_idx,
+                    gt_image.permute(1, 2, 0),
+                )
+            if args.use_uncertainty_weight:
+                with torch.no_grad():
+                    gaussians.compute_uncertainty_weights(
+                        gamma=args.uncertainty_gamma,
+                        reset_stats=False,
+                    )
+                uncertainty_map = gaussians.get_uncertainty_map(gaussian_idx)
+            else:
+                uncertainty_map = None
+        else:
+            uncertainty_map = None
+
         # Rendering loss
         if args.decoupled_appearance:
             Ll1 = L1_loss_appearance(image, gt_image, gaussians, viewpoint_cam.uid)
         else:
             Ll1 = l1_loss(image, gt_image)
+        if args.use_uncertainty_weight and (uncertainty_map is not None):
+            weighted_diff = (image - gt_image) ** 2
+            Ll1 = (uncertainty_map.unsqueeze(0) * weighted_diff).sum() / (
+                uncertainty_map.sum() * 3.0 + 1e-6
+            )
         ssim_value = fused_ssim(image.unsqueeze(0), gt_image.unsqueeze(0))
         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim_value)
         
@@ -327,7 +359,7 @@ def training(
             ) = log_training_progress(
                 args, iteration, log_interval, progress_bar, run,
                 scene, gaussians, pipe, opt, background,
-                viewpoint_idx, viewpoint_cam, render_pkg, 
+                viewpoint_idx, viewpoint_cam, render_pkg, gaussian_idx, gt_image,
                 mesh_render_pkg if mesh_kick_on else None, 
                 do_supervision_depth if depth_order_kick_on else None,
                 reg_kick_on, mesh_kick_on, depth_order_kick_on,
@@ -569,8 +601,12 @@ if __name__ == "__main__":
     # ----- Adaptive mesh-guided pruning -----
     parser.add_argument("--mesh_prune_keep_mass", type=float, default=0.90)
     parser.add_argument("--mesh_prune_lambda", type=float, default=10.0)
-    parser.add_argument("--mesh_prune_band", type=float, default=0.05)
-    parser.add_argument("--mesh_prune_min_vis", type=float, default=1.0)
+    parser.add_argument("--mesh_prune_band", type=float, default=0.025)
+    parser.add_argument("--mesh_prune_min_vis", type=float, default=2.0)
+
+    # ----- Uncertainty weighting -----
+    parser.add_argument("--uncertainty_gamma", type=float, default=0.2)
+    parser.add_argument("--use_uncertainty_weight", action="store_true", help="Weight photometric loss with uncertainty map")
 
     # ----- Depth-Normal consistency Regularization -----
     # > Inspired by 2DGS, GOF, RaDe-GS...
